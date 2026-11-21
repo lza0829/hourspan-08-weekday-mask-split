@@ -6,6 +6,7 @@ import Detect from "./pages/Detect.jsx";
 import History from "./pages/History.jsx";
 import Current from "./pages/Current.jsx";
 import Proofs from "./pages/Proofs.jsx";
+import MaskSplit from "./pages/MaskSplit.jsx";
 import Settings from "./pages/Settings.jsx";
 
 const links = [
@@ -15,6 +16,7 @@ const links = [
   ["/history", "历史维"],
   ["/current", "当前镜"],
   ["/proofs", "核证"],
+  ["/mask-split", "mask 开段"],
   ["/settings", "站规"],
 ];
 
@@ -42,6 +44,7 @@ export default function App() {
           <Route path="/history" element={<History />} />
           <Route path="/current" element={<Current />} />
           <Route path="/proofs" element={<Proofs />} />
+          <Route path="/mask-split" element={<MaskSplit />} />
           <Route path="/settings" element={<Settings />} />
         </Routes>
       </main>

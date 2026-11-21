@@ -22,3 +22,18 @@ npm run dev
 ```
 
 或：`docker compose up -d --build`（6200 / 11200）
+
+## 已实现（本分支）：`weekday_mask_split`
+
+仅 `weekday_mask` 位图翻转也算属性变更，必须关旧开新，禁止原地改 mask。
+
+- 检测基准：现行有效段 `dim_store_hours_hist.is_current=1`，逐字段比对；mask 任一 bit 变化即 `kind=mask_change`，不会因其它字段未变而跳过。
+- 落库形态（择一，取甲）：标准 Type2 新段（关旧 + 开新）；库内触发器禁止原地 UPDATE 历史维 mask。
+- 失败闭（择一，取甲）：开闭 + 当前镜 + 本检测成员写回同一事务；失败整体回滚；`detect_apply_marks` 跑次级幂等；唯一部分索引禁止双 `is_current`。
+- hash 规范串：`open_time|close_time|weekday_mask|biz_status`；漏算 mask 的 hash 会被核证判失败。
+- 只读核证接口：`GET /api/proofs/mask-open?store_id=&detect_run_id=`，回出旧/新 mask、`old_hist_id`/`hist_id`、检测 `to_hash` / 历史行 hash / 当前镜 hash 三方比对与失败原因。
+- 夹具：`fixtures/mask_only_flip.json`（只翻 mask，其它营业字段不变）。
+
+核证页：前端「mask 开段」（`/mask-split`）可一键入档夹具 → 检测 → 开段 → 核证。
+
+测试：`cd backend && python -m pytest tests -q`

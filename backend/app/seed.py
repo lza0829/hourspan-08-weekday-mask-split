@@ -1,5 +1,6 @@
 import hashlib
 import json
+import sqlite3
 from datetime import datetime, timezone
 
 from app.db import FIXTURES_DIR, connect
@@ -87,27 +88,79 @@ CREATE TABLE IF NOT EXISTS scd_proofs (
   created_at TEXT NOT NULL
 );
 
+-- 检测成员写回标记：与开闭/镜同事务写入，保证「检测已记变更」与「历史维已开段」
+-- 不可能一半成功。再次应用同一跑次时据此幂等拒绝。
+-- 落库形态取「甲」：标准 Type2 新段（不另立 mask 变更边表，避免形态二义）。
+CREATE TABLE IF NOT EXISTS detect_apply_marks (
+  detect_run_id TEXT PRIMARY KEY,
+  applied_at TEXT NOT NULL,
+  result_json TEXT NOT NULL DEFAULT '{}'
+);
+
 CREATE INDEX IF NOT EXISTS idx_hist_store_current
   ON dim_store_hours_hist(store_id, is_current);
 CREATE INDEX IF NOT EXISTS idx_snap_store_ts
   ON source_snapshots(store_id, as_of_ts);
+
+-- 禁止原地改历史维 mask：mask 变化只能关旧开新。
+CREATE TRIGGER IF NOT EXISTS trg_hist_mask_no_inplace_update
+BEFORE UPDATE OF weekday_mask ON dim_store_hours_hist
+WHEN OLD.weekday_mask IS NOT NEW.weekday_mask
+BEGIN
+  SELECT RAISE(ABORT, 'hist_weekday_mask_in_place_update_forbidden');
+END;
 """
+
+
+def _ensure_current_unique_index(conn):
+    """每个门店至多一条 is_current=1；已有脏数据时保留启动能力但显式跳过。"""
+    try:
+        conn.execute(
+            """CREATE UNIQUE INDEX IF NOT EXISTS uq_hist_current_per_store
+               ON dim_store_hours_hist(store_id) WHERE is_current=1"""
+        )
+    except sqlite3.IntegrityError:
+        pass
 
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def canonical_row(open_time, close_time, weekday_mask, biz_status) -> str:
+    """营业属性规范串。weekday_mask 是必含字段，任何漏算 mask 的变体都会得到不同 hash。"""
+    return f"{open_time or ''}|{close_time or ''}|{weekday_mask or ''}|{biz_status or ''}"
+
+
 def row_hash(open_time, close_time, weekday_mask, biz_status) -> str:
-    raw = f"{open_time or ''}|{close_time or ''}|{weekday_mask}|{biz_status}"
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+    return hashlib.sha256(canonical_row(open_time, close_time, weekday_mask, biz_status).encode("utf-8")).hexdigest()[:16]
+
+
+def mask_bits(mask: str | None) -> str:
+    return (mask or "").strip()
+
+
+def mask_changed_bits(old_mask: str | None, new_mask: str | None) -> str:
+    """返回发生翻转的位下标（从 0 起），长度不一致时按最长比较、缺位视为翻转。"""
+    old = mask_bits(old_mask)
+    new = mask_bits(new_mask)
+    changed = []
+    for i in range(max(len(old), len(new))):
+        a = old[i] if i < len(old) else ""
+        b = new[i] if i < len(new) else ""
+        if a != b:
+            changed.append(str(i))
+    return ",".join(changed)
 
 
 def init_db():
     conn = connect()
     conn.executescript(SCHEMA)
+    _ensure_current_unique_index(conn)
     if not conn.execute("SELECT 1 FROM settings WHERE key='as_of_mode'").fetchone():
         conn.execute("INSERT INTO settings(key, value) VALUES ('as_of_mode', 'business_ts')")
+    if not conn.execute("SELECT 1 FROM settings WHERE key='mask_hash_version'").fetchone():
+        conn.execute("INSERT INTO settings(key, value) VALUES ('mask_hash_version', 'mask-in-canonical-v1')")
     if conn.execute("SELECT COUNT(*) AS c FROM stores").fetchone()["c"] == 0:
         _seed(conn)
     conn.commit()

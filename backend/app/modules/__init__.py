@@ -7,7 +7,6 @@ STUBS = [
     "current_mirror_resync",
     "as_of_query_proof",
     "business_key_rebind",
-    "weekday_mask_split",
     "open_close_order_fence",
     "hist_row_hash_proof",
     "detect_coverage_member_proof",

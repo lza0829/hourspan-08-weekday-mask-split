@@ -1,98 +1,17 @@
 import json
-from uuid import uuid4
 
 from app.db import connect
-from app.seed import now_iso, row_hash
+from app.modules import weekday_mask_split
+from app.seed import canonical_row, now_iso, row_hash
 
 
 def apply_type2(detect_run_id: str):
-    """Close current hist rows and open new ones for changes in a detect run; refresh mirror."""
-    conn = connect()
-    now = now_iso()
-    try:
-        run = conn.execute(
-            "SELECT * FROM detect_runs WHERE id=?", (detect_run_id,)
-        ).fetchone()
-        if not run:
-            return {"ok": False, "message": "检测跑次不存在"}
-        report = json.loads(run["report_json"])
-        changes = report.get("changes", [])
-        applied = []
-        for ch in changes:
-            store_id = ch["store_id"]
-            snap = conn.execute(
-                "SELECT * FROM source_snapshots WHERE id=?", (ch["snapshot_id"],)
-            ).fetchone()
-            if not snap:
-                continue
-            cur_hist = conn.execute(
-                "SELECT * FROM dim_store_hours_hist WHERE store_id=? AND is_current=1",
-                (store_id,),
-            ).fetchone()
-            valid_from = snap["as_of_ts"]
-            if cur_hist:
-                conn.execute(
-                    """UPDATE dim_store_hours_hist
-                       SET valid_to=?, is_current=0, closed_by_run=?
-                       WHERE id=?""",
-                    (valid_from, detect_run_id, cur_hist["id"]),
-                )
-            new_id = f"HIST-{uuid4().hex[:10]}"
-            rh = snap["row_hash"]
-            conn.execute(
-                """INSERT INTO dim_store_hours_hist(
-                  id, store_id, open_time, close_time, weekday_mask, biz_status,
-                  valid_from, valid_to, is_current, source_snapshot_id, row_hash, closed_by_run
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (
-                    new_id,
-                    store_id,
-                    snap["open_time"],
-                    snap["close_time"],
-                    snap["weekday_mask"],
-                    snap["biz_status"],
-                    valid_from,
-                    None,
-                    1,
-                    snap["id"],
-                    rh,
-                    None,
-                ),
-            )
-            conn.execute(
-                """INSERT INTO dim_store_hours_current(
-                  store_id, open_time, close_time, weekday_mask, biz_status,
-                  hist_id, as_of_ts, row_hash
-                ) VALUES (?,?,?,?,?,?,?,?)
-                ON CONFLICT(store_id) DO UPDATE SET
-                  open_time=excluded.open_time,
-                  close_time=excluded.close_time,
-                  weekday_mask=excluded.weekday_mask,
-                  biz_status=excluded.biz_status,
-                  hist_id=excluded.hist_id,
-                  as_of_ts=excluded.as_of_ts,
-                  row_hash=excluded.row_hash
-                """,
-                (
-                    store_id,
-                    snap["open_time"],
-                    snap["close_time"],
-                    snap["weekday_mask"],
-                    snap["biz_status"],
-                    new_id,
-                    valid_from,
-                    rh,
-                ),
-            )
-            applied.append({"store_id": store_id, "hist_id": new_id, "closed": cur_hist["id"] if cur_hist else None})
-        conn.commit()
-        return {"ok": True, "applied": applied, "count": len(applied), "detect_run_id": detect_run_id}
-    finally:
-        conn.close()
+    """Close/open Type2 rows for a detect run; single transaction via weekday_mask_split."""
+    return weekday_mask_split.apply_run(detect_run_id)
 
 
 def rebuild_proofs():
-    """Attest: each current mirror hist_id must point to is_current=1 hist with same hash."""
+    """Attest: mirror hist_id must point to the single is_current hist with canonical hash/mask."""
     conn = connect()
     now = now_iso()
     try:
@@ -102,6 +21,10 @@ def rebuild_proofs():
             hist = conn.execute(
                 "SELECT * FROM dim_store_hours_hist WHERE id=?", (m["hist_id"],)
             ).fetchone()
+            current_count = conn.execute(
+                "SELECT COUNT(*) AS c FROM dim_store_hours_hist WHERE store_id=? AND is_current=1",
+                (m["store_id"],),
+            ).fetchone()["c"]
             valid = 1
             detail = {}
             if not hist:
@@ -110,14 +33,37 @@ def rebuild_proofs():
             elif hist["is_current"] != 1:
                 valid = 0
                 detail["error"] = "mirror_not_current_hist"
+            elif current_count != 1:
+                valid = 0
+                detail["error"] = "double_current"
             elif hist["row_hash"] != m["row_hash"]:
                 valid = 0
                 detail["error"] = "hash_mismatch"
             elif hist["store_id"] != m["store_id"]:
                 valid = 0
                 detail["error"] = "store_mismatch"
+            elif hist["weekday_mask"] != m["weekday_mask"]:
+                valid = 0
+                detail["error"] = "mask_mismatch"
             else:
-                detail["ok"] = True
+                canonical = row_hash(
+                    hist["open_time"],
+                    hist["close_time"],
+                    hist["weekday_mask"],
+                    hist["biz_status"],
+                )
+                if hist["row_hash"] != canonical or m["row_hash"] != canonical:
+                    valid = 0
+                    detail["error"] = "hash_not_include_mask"
+                    detail["canonical"] = canonical
+                    detail["canonical_src"] = canonical_row(
+                        hist["open_time"],
+                        hist["close_time"],
+                        hist["weekday_mask"],
+                        hist["biz_status"],
+                    )
+                else:
+                    detail["ok"] = True
             conn.execute(
                 """INSERT INTO scd_proofs(
                   store_id, hist_id, mirror_hist_id, row_hash, valid, detail_json, created_at
@@ -132,7 +78,14 @@ def rebuild_proofs():
                     now,
                 ),
             )
-            results.append({"store_id": m["store_id"], "valid": bool(valid), "detail": detail})
+            results.append(
+                {
+                    "store_id": m["store_id"],
+                    "valid": bool(valid),
+                    "detail": detail,
+                    "mask": m["weekday_mask"],
+                }
+            )
         conn.commit()
         return {
             "checked": len(results),

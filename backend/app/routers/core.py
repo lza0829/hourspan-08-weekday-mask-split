@@ -1,7 +1,7 @@
-from fastapi import APIRouter, Body, HTTPException
+from fastapi import APIRouter, Body, HTTPException, Query
 
 from app.db import connect
-from app.modules import STUBS
+from app.modules import STUBS, weekday_mask_split
 from app.services import catalog, detect, ingest, scd
 
 router = APIRouter(prefix="/api")
@@ -141,6 +141,17 @@ def run_scd(body: dict = Body(...)):
     if not run_id:
         raise HTTPException(400, "需要 detect_run_id")
     return scd.apply_type2(run_id)
+
+
+@router.get("/proofs/mask-open")
+def mask_open_proof(
+    store_id: str | None = Query(None),
+    detect_run_id: str | None = Query(None),
+):
+    """只读核证：mask 开段（旧/新 mask、三方 hash、hist_id）。不写库。"""
+    return weekday_mask_split.mask_open_proof(
+        store_id=store_id, detect_run_id=detect_run_id
+    )
 
 
 @router.post("/proofs/rebuild")
